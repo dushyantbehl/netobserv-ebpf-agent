@@ -84,12 +84,12 @@ volatile const u8 trace_messages = 0;
 const u8 ip4in6[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
 
 // sets the TCP header flags for connection information
-// returns true if connection timestamp needs to be stored
-static inline bool set_flags(struct tcphdr *th, int direction, u16 *flags) {
+// and sets record_conn_ts to 1 if connection timestamp needs to be stored
+static inline void set_flags(struct tcphdr *th, int direction, u16 *flags, u8 *record_conn_ts) {
     //If both ACK and SYN are set, then it is server -> client communication during 3-way handshake. 
     if (th->ack && th->syn) {
         *flags |= SYN_ACK_FLAG;
-        return true;
+        *record_conn_ts = 1;
     } else if (th->ack && th->fin ) {
         // If both ACK and FIN are set, then it is graceful termination from server.
         *flags |= FIN_ACK_FLAG;
@@ -102,8 +102,9 @@ static inline bool set_flags(struct tcphdr *th, int direction, u16 *flags) {
         *flags |= SYN_FLAG;
     } else if (th->ack) {
         *flags |= ACK_FLAG;
+        // During ingress this is the seq1 packet with ACK
         if (direction == INGRESS && th->seq == 1) {
-            return true;
+            *record_conn_ts = 1;
         }
     } else if (th->rst) {
         *flags |= RST_FLAG;
@@ -116,7 +117,7 @@ static inline bool set_flags(struct tcphdr *th, int direction, u16 *flags) {
     } else if (th->cwr) {
         *flags |= CWR_FLAG;
     }
-    return false;
+    return;
 }
 
 // L4_info structure contains L4 headers parsed information.
@@ -132,7 +133,7 @@ struct l4_info_t {
     // TCP flags
     u16 flags;
 	// Connection timestamp capture
-	bool conn_tstamp; 
+	u8 record_conn_ts; 
 };
 
 // Extract L4 info for the supported protocols
@@ -144,7 +145,7 @@ static inline void fill_l4info(void *l4_hdr_start, void *data_end, u8 direction,
         if ((void *)tcp + sizeof(*tcp) <= data_end) {
             l4_info->src_port = __bpf_ntohs(tcp->source);
             l4_info->dst_port = __bpf_ntohs(tcp->dest);
-            l4_info->conn_tstamp = set_flags(tcp, direction, &l4_info->flags);
+            set_flags(tcp, direction, &l4_info->flags, &l4_info->record_conn_ts);
         }
     } break;
     case IPPROTO_UDP: {
@@ -181,7 +182,7 @@ static inline void fill_l4info(void *l4_hdr_start, void *data_end, u8 direction,
 }
 
 // sets flow fields from IPv4 header information
-static inline int fill_iphdr(struct iphdr *ip, void *data_end, u8 direction, flow_id *id, u16 *flags, bool *conn_tstamp) {
+static inline int fill_iphdr(struct iphdr *ip, void *data_end, u8 direction, flow_id *id, u16 *flags, u8 *record_conn_ts) {
     struct l4_info_t l4_info;
     void *l4_hdr_start;
 
@@ -201,13 +202,13 @@ static inline int fill_iphdr(struct iphdr *ip, void *data_end, u8 direction, flo
     id->icmp_type = l4_info.icmp_type;
     id->icmp_code = l4_info.icmp_code;
     *flags = l4_info.flags;
-	*conn_tstamp = l4_info.conn_tstamp;
+	*record_conn_ts = l4_info.record_conn_ts;
 
     return SUBMIT;
 }
 
 // sets flow fields from IPv6 header information
-static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, u8 direction, flow_id *id, u16 *flags, bool *conn_tstamp) {
+static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, u8 direction, flow_id *id, u16 *flags, u8 *record_conn_ts) {
     struct l4_info_t l4_info;
     void *l4_hdr_start;
 
@@ -225,12 +226,12 @@ static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, u8 direction, 
     id->icmp_type = l4_info.icmp_type;
     id->icmp_code = l4_info.icmp_code;
     *flags = l4_info.flags;
-	*conn_tstamp = l4_info.conn_tstamp;
+	*record_conn_ts = l4_info.record_conn_ts;
 
     return SUBMIT;
 }
 // sets flow fields from Ethernet header information
-static inline int fill_ethhdr(struct ethhdr *eth, void *data_end, u8 direction, flow_id *id, u16 *flags, bool *conn_tstamp) {
+static inline int fill_ethhdr(struct ethhdr *eth, void *data_end, u8 direction, flow_id *id, u16 *flags, u8 *record_conn_ts) {
     if ((void *)eth + sizeof(*eth) > data_end) {
         return DISCARD;
     }
@@ -240,10 +241,10 @@ static inline int fill_ethhdr(struct ethhdr *eth, void *data_end, u8 direction, 
 
     if (id->eth_protocol == ETH_P_IP) {
         struct iphdr *ip = (void *)eth + sizeof(*eth);
-        return fill_iphdr(ip, data_end, direction, id, flags, conn_tstamp);
+        return fill_iphdr(ip, data_end, direction, id, flags, record_conn_ts);
     } else if (id->eth_protocol == ETH_P_IPV6) {
         struct ipv6hdr *ip6 = (void *)eth + sizeof(*eth);
-        return fill_ip6hdr(ip6, data_end, direction, id, flags, conn_tstamp);
+        return fill_ip6hdr(ip6, data_end, direction, id, flags, record_conn_ts);
     } else {
         // TODO : Need to implement other specific ethertypes if needed
         // For now other parts of flow id remain zero
@@ -265,12 +266,12 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
     void *data = (void *)(long)skb->data;
 
     flow_id id;
-	bool conn_tstamp = false;
+	u8 record_conn_ts = 0;
     __builtin_memset(&id, 0, sizeof(id));
     u64 current_time = bpf_ktime_get_ns();
     struct ethhdr *eth = data;
     u16 flags = 0;
-    if (fill_ethhdr(eth, data_end, direction, &id, &flags, &conn_tstamp) == DISCARD) {
+    if (fill_ethhdr(eth, data_end, direction, &id, &flags, &record_conn_ts) == DISCARD) {
         return TC_ACT_OK;
     }
     id.if_index = skb->ifindex;
@@ -288,7 +289,7 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
         if (aggregate_flow->start_mono_time_ts == 0) {
             aggregate_flow->start_mono_time_ts = current_time;
         }
-        if (conn_tstamp) {
+        if (record_conn_ts) {
             aggregate_flow->conn_mono_time_ts = current_time;
         }
         aggregate_flow->flags |= flags;
@@ -310,7 +311,7 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
             .end_mono_time_ts = current_time,
             .flags = flags, 
         };
-        if (conn_tstamp) {
+        if (record_conn_ts) {
             new_flow.conn_mono_time_ts = current_time;
         }
 
@@ -342,6 +343,7 @@ static inline int flow_monitor(struct __sk_buff *skb, u8 direction) {
     }
     return TC_ACT_OK;
 }
+
 SEC("tc_ingress")
 int ingress_flow_parse(struct __sk_buff *skb) {
     return flow_monitor(skb, INGRESS);

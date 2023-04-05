@@ -13,7 +13,7 @@ typedef __u64 u64;
 typedef struct flow_metrics_t {
     u32 packets;
     u64 bytes;
-    // Flow start and end times as monotomic timestamps in nanoseconds
+    // Flow start and end times as monotonic timestamps in nanoseconds
     // as output from bpf_ktime_get_ns()
     u64 start_mono_time_ts;
     u64 conn_mono_time_ts;
