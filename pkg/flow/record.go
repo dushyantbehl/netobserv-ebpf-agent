@@ -15,6 +15,25 @@ const (
 	DirectionIngress = uint8(0)
 	DirectionEgress  = uint8(1)
 )
+
+const (
+	// TCP flags according to https://www.iana.org/assignments/ipfix/ipfix.xhtml
+	TcpFinFlag = uint32(0x01)
+	TcpSynFlag = uint32(0x02)
+	TcpRstFlag = uint32(0x04)
+	TcpPshFlag = uint32(0x08)
+	TcpAckFlag = uint32(0x10)
+	TcpUrgFlag = uint32(0x20)
+	TcpEceFlag = uint32(0x40)
+	TcpCwrFlag = uint32(0x80)
+
+	//Custom flags
+	CustomSynAckFlag  = uint32(0x100)
+	CustomFinAckFlag  = uint32(0x200)
+	CustomRstAckFlag  = uint32(0x400)
+	CustomAckSeq1Flag = uint32(0x800)
+)
+
 const MacLen = 6
 
 // IPv6Type value as defined in IEEE 802: https://www.iana.org/assignments/ieee-802-numbers/ieee-802-numbers.xhtml
@@ -39,6 +58,7 @@ type Record struct {
 	// TODO: redundant field from RecordMetrics. Reorganize structs
 	TimeFlowStart time.Time
 	TimeFlowEnd   time.Time
+	FlowLatency   time.Duration
 	Interface     string
 	// Duplicate tells whether this flow has another duplicate so it has to be excluded from
 	// any metrics' aggregation (e.g. bytes/second rates between two pods).
@@ -81,6 +101,12 @@ func Accumulate(r *ebpf.BpfFlowMetrics, src *ebpf.BpfFlowMetrics) {
 	r.Bytes += src.Bytes
 	r.Packets += src.Packets
 	r.Flags |= src.Flags
+
+	// If the new packet has ConnMonoTime set then this must be the handshake pakcet.
+	// The conjecture here is that for a flow only one packet records the handshake timestamp
+	if src.ConnMonoTimeTs > 0 {
+		r.ConnMonoTimeTs = src.ConnMonoTimeTs
+	}
 }
 
 // IP returns the net.IP equivalent object

@@ -50,11 +50,7 @@ func (c *Accounter) Account(in <-chan *RawRecord, out chan<- []*Record) {
 			if len(c.entries) == 0 {
 				break
 			}
-			evictingEntries := c.entries
-			c.entries = map[ebpf.BpfFlowId]*ebpf.BpfFlowMetrics{}
-			logrus.WithField("flows", len(evictingEntries)).
-				Debug("evicting flows from userspace accounter on timeout")
-			c.evict(evictingEntries, out)
+			c.evictFullMap(out, "on timeout")
 		case record, ok := <-in:
 			if !ok {
 				alog.Debug("input channel closed. Evicting entries")
@@ -67,14 +63,9 @@ func (c *Accounter) Account(in <-chan *RawRecord, out chan<- []*Record) {
 			}
 			if stored, ok := c.entries[record.Id]; ok {
 				Accumulate(stored, &record.Metrics)
-				//TODO : Calculate the RTT here!!
 			} else {
 				if len(c.entries) >= c.maxEntries {
-					evictingEntries := c.entries
-					c.entries = map[ebpf.BpfFlowId]*ebpf.BpfFlowMetrics{}
-					logrus.WithField("flows", len(evictingEntries)).
-						Debug("evicting flows from userspace accounter after reaching cache max length")
-					c.evict(evictingEntries, out)
+					c.evictFullMap(out, "reached cache max length")
 				}
 				c.entries[record.Id] = &record.Metrics
 			}
@@ -82,12 +73,40 @@ func (c *Accounter) Account(in <-chan *RawRecord, out chan<- []*Record) {
 	}
 }
 
+func (c *Accounter) evictFullMap(out chan<- []*Record, msg string) {
+	// Create a new map and evict the old map right away
+	evictingEntries := c.entries
+	c.entries = map[ebpf.BpfFlowId]*ebpf.BpfFlowMetrics{}
+	logrus.WithField("flows", len(evictingEntries)).
+		Debug("evicting flows from userspace accounter: " + msg)
+	c.evict(evictingEntries, out)
+}
+
+/*
+ *
+ *          |                             |
+ *          |        SYN (SEQ X)          |
+ *  (Egress)|---------------------------->| (Ingress)
+ *          |                             |
+ *          |   SYN(SEQ Y):ACK(SEQ X+1)   |
+ * (Ingress)|<----------------------------| (Egress)
+ *          |                             |
+ *          |       ACK (SEQ Y+1)         |
+ *  (Egress)|---------------------------->| (Ingress)
+ *          |                             |
+ *
+ */
+
+func (c *Accounter) calculatePathRTT(metrics *ebpf.BpfFlowMetrics, record *Record) {
+
+}
+
 func (c *Accounter) evict(entries map[ebpf.BpfFlowId]*ebpf.BpfFlowMetrics, evictor chan<- []*Record) {
 	now := c.clock()
 	monotonicNow := uint64(c.monoClock())
 	records := make([]*Record, 0, len(entries))
-	for key, metrics := range entries {
-		records = append(records, NewRecord(key, *metrics, now, monotonicNow))
+	for id, metrics := range entries {
+		records = append(records, NewRecord(id, *metrics, now, monotonicNow))
 	}
 	alog.WithField("numEntries", len(records)).Debug("records evicted from userspace accounter")
 	evictor <- records
