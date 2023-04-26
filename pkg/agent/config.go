@@ -136,4 +136,6 @@ type Config struct {
 	KafkaSASLClientSecretPath string `env:"KAFKA_SASL_CLIENT_SECRET_PATH"`
 	// ProfilePort sets the listening port for Go's Pprof tool. If it is not set, profile is disabled
 	ProfilePort int `env:"PROFILE_PORT"`
+	// EnableTcpDrops enable TCP drops eBPF hook to account for tcp dropped flows
+	EnableTCPDrops bool `env:"ENABLE_TCP_DROPS" envDefault:"false"`
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/netobserv/netobserv-ebpf-agent/pkg/ifaces"
@@ -16,7 +17,7 @@ import (
 )
 
 // $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
-//go:generate bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -type flow_metrics_t -type flow_id_t -type flow_record_t Bpf ../../bpf/flows.c -- -I../../bpf/headers
+//go:generate bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -type flow_metrics_t -type flow_id_t -type flow_record_t -type tcp_drops_t Bpf ../../bpf/flows.c -- -I../../bpf/headers
 
 const (
 	qdiscType = "clsact"
@@ -33,20 +34,21 @@ var log = logrus.WithField("component", "ebpf.FlowFetcher")
 // and to flows that are forwarded by the kernel via ringbuffer because could not be aggregated
 // in the map
 type FlowFetcher struct {
-	objects        *BpfObjects
-	qdiscs         map[ifaces.Interface]*netlink.GenericQdisc
-	egressFilters  map[ifaces.Interface]*netlink.BpfFilter
-	ingressFilters map[ifaces.Interface]*netlink.BpfFilter
-	ringbufReader  *ringbuf.Reader
-	cacheMaxSize   int
-	enableIngress  bool
-	enableEgress   bool
+	objects            *BpfObjects
+	qdiscs             map[ifaces.Interface]*netlink.GenericQdisc
+	egressFilters      map[ifaces.Interface]*netlink.BpfFilter
+	ingressFilters     map[ifaces.Interface]*netlink.BpfFilter
+	ringbufReader      *ringbuf.Reader
+	cacheMaxSize       int
+	enableIngress      bool
+	enableEgress       bool
+	tcpDropsTracePoint link.Link
 }
 
 func NewFlowFetcher(
 	traceMessages bool,
 	sampling, cacheMaxSize int,
-	ingress, egress bool,
+	ingress, egress, tcpDrops bool,
 ) (*FlowFetcher, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.WithError(err).
@@ -72,6 +74,7 @@ func NewFlowFetcher(
 	}); err != nil {
 		return nil, fmt.Errorf("rewriting BPF constants definition: %w", err)
 	}
+
 	if err := spec.LoadAndAssign(&objects, nil); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -82,20 +85,29 @@ func NewFlowFetcher(
 		return nil, fmt.Errorf("loading and assigning BPF objects: %w", err)
 	}
 
+	var tcpDropsLink link.Link
+	if tcpDrops {
+		tcpDropsLink, err = link.Tracepoint("skb", "kfree_skb", objects.KfreeSkb, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to attach the BPF program to kfree_skb tracepoint: %w", err)
+		}
+	}
+
 	// read events from igress+egress ringbuffer
 	flows, err := ringbuf.NewReader(objects.DirectFlows)
 	if err != nil {
 		return nil, fmt.Errorf("accessing to ringbuffer: %w", err)
 	}
 	return &FlowFetcher{
-		objects:        &objects,
-		ringbufReader:  flows,
-		egressFilters:  map[ifaces.Interface]*netlink.BpfFilter{},
-		ingressFilters: map[ifaces.Interface]*netlink.BpfFilter{},
-		qdiscs:         map[ifaces.Interface]*netlink.GenericQdisc{},
-		cacheMaxSize:   cacheMaxSize,
-		enableIngress:  ingress,
-		enableEgress:   egress,
+		objects:            &objects,
+		ringbufReader:      flows,
+		egressFilters:      map[ifaces.Interface]*netlink.BpfFilter{},
+		ingressFilters:     map[ifaces.Interface]*netlink.BpfFilter{},
+		qdiscs:             map[ifaces.Interface]*netlink.GenericQdisc{},
+		cacheMaxSize:       cacheMaxSize,
+		enableIngress:      ingress,
+		enableEgress:       egress,
+		tcpDropsTracePoint: tcpDropsLink,
 	}, nil
 }
 
@@ -215,6 +227,10 @@ func (m *FlowFetcher) Close() error {
 	log.Debug("unregistering eBPF objects")
 
 	var errs []error
+
+	if m.tcpDropsTracePoint != nil {
+		m.tcpDropsTracePoint.Close()
+	}
 	// m.ringbufReader.Read is a blocking operation, so we need to close the ring buffer
 	// from another goroutine to avoid the system not being able to exit if there
 	// isn't traffic in a given interface
