@@ -1,7 +1,6 @@
 #ifndef __UTILS_H__
 #define __UTILS_H__
 
-#define BPF_NO_PRESERVE_ACCESS_INDEX   // FIXME: remove once https://github.com/libbpf/libbpf/issues/697 is resolved
 #include <vmlinux.h>
 #include <bpf_helpers.h>
 
