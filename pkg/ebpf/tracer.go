@@ -146,7 +146,7 @@ func (m *FlowFetcher) Register(iface ifaces.Interface) error {
 		if errors.Is(err, fs.ErrExist) {
 			ilog.WithError(err).Warn("qdisc clsact already exists. Ignoring")
 		} else {
-			return fmt.Errorf("failed to create clsact qdisc on %d (%s): %T %w", iface.Index, iface.Name, err, err)
+			return fmt.Errorf("failed to create clsact qdisc on %d (%s): %w", iface.Index, iface.Name, err)
 		}
 	}
 	m.qdiscs[iface] = qdisc
@@ -155,11 +155,7 @@ func (m *FlowFetcher) Register(iface ifaces.Interface) error {
 		return err
 	}
 
-	if err := m.registerIngress(iface, ipvlan); err != nil {
-		return err
-	}
-
-	return nil
+	return m.registerIngress(iface, ipvlan)
 }
 
 func (m *FlowFetcher) registerEgress(iface ifaces.Interface, ipvlan netlink.Link) error {
