@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/netobserv/netobserv-ebpf-agent/pkg/ifaces"
@@ -16,7 +18,7 @@ import (
 )
 
 // $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
-//go:generate bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -type flow_metrics_t -type flow_id_t -type flow_record_t Bpf ../../bpf/flows.c -- -I../../bpf/headers
+//go:generate bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -type flow_metrics_t -type flow_id_t -type flow_record_t -type tcp_drops_t -type dns_record_t Bpf ../../bpf/flows.c -- -I../../bpf/headers
 
 const (
 	qdiscType = "clsact"
@@ -33,20 +35,22 @@ var log = logrus.WithField("component", "ebpf.FlowFetcher")
 // and to flows that are forwarded by the kernel via ringbuffer because could not be aggregated
 // in the map
 type FlowFetcher struct {
-	objects        *BpfObjects
-	qdiscs         map[ifaces.Interface]*netlink.GenericQdisc
-	egressFilters  map[ifaces.Interface]*netlink.BpfFilter
-	ingressFilters map[ifaces.Interface]*netlink.BpfFilter
-	ringbufReader  *ringbuf.Reader
-	cacheMaxSize   int
-	enableIngress  bool
-	enableEgress   bool
+	objects              *BpfObjects
+	qdiscs               map[ifaces.Interface]*netlink.GenericQdisc
+	egressFilters        map[ifaces.Interface]*netlink.BpfFilter
+	ingressFilters       map[ifaces.Interface]*netlink.BpfFilter
+	ringbufReader        *ringbuf.Reader
+	cacheMaxSize         int
+	enableIngress        bool
+	enableEgress         bool
+	tcpDropsTracePoint   link.Link
+	dnsTrackerTracePoint link.Link
 }
 
 func NewFlowFetcher(
 	traceMessages bool,
 	sampling, cacheMaxSize int,
-	ingress, egress bool,
+	ingress, egress, tcpDrops, dnsTracker bool,
 ) (*FlowFetcher, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.WithError(err).
@@ -72,6 +76,7 @@ func NewFlowFetcher(
 	}); err != nil {
 		return nil, fmt.Errorf("rewriting BPF constants definition: %w", err)
 	}
+
 	if err := spec.LoadAndAssign(&objects, nil); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -82,20 +87,45 @@ func NewFlowFetcher(
 		return nil, fmt.Errorf("loading and assigning BPF objects: %w", err)
 	}
 
+	var tcpDropsLink link.Link
+	if tcpDrops {
+		tcpDropsLink, err = link.Tracepoint("skb", "kfree_skb", objects.KfreeSkb, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to attach the BPF program to kfree_skb tracepoint: %w", err)
+		}
+	}
+
+	var dnsTrackerLink link.Link
+	if dnsTracker {
+		dnsTrackerLink, err = link.Tracepoint("net", "net_dev_queue", objects.TraceNetPackets, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to attach the BPF program to trace_net_packets: %w", err)
+		}
+	}
+
+	/*
+	 * since we load the program only when the we start we need to release
+	 * memory used by cached kernel BTF see https://github.com/cilium/ebpf/issues/1063
+	 * for more details.
+	 */
+	btf.FlushKernelSpec()
+
 	// read events from igress+egress ringbuffer
 	flows, err := ringbuf.NewReader(objects.DirectFlows)
 	if err != nil {
 		return nil, fmt.Errorf("accessing to ringbuffer: %w", err)
 	}
 	return &FlowFetcher{
-		objects:        &objects,
-		ringbufReader:  flows,
-		egressFilters:  map[ifaces.Interface]*netlink.BpfFilter{},
-		ingressFilters: map[ifaces.Interface]*netlink.BpfFilter{},
-		qdiscs:         map[ifaces.Interface]*netlink.GenericQdisc{},
-		cacheMaxSize:   cacheMaxSize,
-		enableIngress:  ingress,
-		enableEgress:   egress,
+		objects:              &objects,
+		ringbufReader:        flows,
+		egressFilters:        map[ifaces.Interface]*netlink.BpfFilter{},
+		ingressFilters:       map[ifaces.Interface]*netlink.BpfFilter{},
+		qdiscs:               map[ifaces.Interface]*netlink.GenericQdisc{},
+		cacheMaxSize:         cacheMaxSize,
+		enableIngress:        ingress,
+		enableEgress:         egress,
+		tcpDropsTracePoint:   tcpDropsLink,
+		dnsTrackerTracePoint: dnsTrackerLink,
 	}, nil
 }
 
@@ -124,7 +154,7 @@ func (m *FlowFetcher) Register(iface ifaces.Interface) error {
 		if errors.Is(err, fs.ErrExist) {
 			ilog.WithError(err).Warn("qdisc clsact already exists. Ignoring")
 		} else {
-			return fmt.Errorf("failed to create clsact qdisc on %d (%s): %T %w", iface.Index, iface.Name, err, err)
+			return fmt.Errorf("failed to create clsact qdisc on %d (%s): %w", iface.Index, iface.Name, err)
 		}
 	}
 	m.qdiscs[iface] = qdisc
@@ -133,11 +163,7 @@ func (m *FlowFetcher) Register(iface ifaces.Interface) error {
 		return err
 	}
 
-	if err := m.registerIngress(iface, ipvlan); err != nil {
-		return err
-	}
-
-	return nil
+	return m.registerIngress(iface, ipvlan)
 }
 
 func (m *FlowFetcher) registerEgress(iface ifaces.Interface, ipvlan netlink.Link) error {
@@ -215,6 +241,14 @@ func (m *FlowFetcher) Close() error {
 	log.Debug("unregistering eBPF objects")
 
 	var errs []error
+
+	if m.tcpDropsTracePoint != nil {
+		m.tcpDropsTracePoint.Close()
+	}
+
+	if m.dnsTrackerTracePoint != nil {
+		m.dnsTrackerTracePoint.Close()
+	}
 	// m.ringbufReader.Read is a blocking operation, so we need to close the ring buffer
 	// from another goroutine to avoid the system not being able to exit if there
 	// isn't traffic in a given interface
